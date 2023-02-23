@@ -1,41 +1,40 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"net"
 	"os"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/hawkinsw/windowpane/window"
 )
-
-func GetTCPInfo(basicConn net.Conn) (*unix.TCPInfo, error) {
-	tcpConn, ok := basicConn.(*net.TCPConn)
-	if !ok {
-		return nil, fmt.Errorf("Could convert to tcp connection!")
-	}
-	var info *unix.TCPInfo = nil
-	rawConn, err := tcpConn.SyscallConn()
-	if err != nil {
-		return nil, err
-	}
-	rawConn.Control(func(fd uintptr) {
-		info, err = unix.GetsockoptTCPInfo(int(fd), unix.SOL_TCP, unix.TCP_INFO)
-	})
-	return info, err
-}
 
 type TransparentClientSender struct {
 	conn         net.Conn
 	totalWritten uint64
 }
 
-func (tsc *TransparentClientSender) Write(p []byte) (n int, err error) {
-	fmt.Printf("Being asked to write %d bytes.\n", len(p))
+func (tsc *TransparentClientSender) Write(p []byte) (written int, err error) {
+	if window.GetSenderWindowAvailable() {
+		if sndWnd, err := window.GetSenderWindow(tsc.conn); err == nil {
+			fmt.Printf("Receiver window: %d\n", sndWnd)
+		} else {
+			fmt.Printf("Receiver window: -1\n")
+		}
+	}
+
 	doneChan := make(chan interface{})
-	var written int = 0
 	go func() {
-		written, err = tsc.conn.Write(p[:10])
+		err = nil
+		written = 0
+		// We will attempt to write until we either
+		// a) send data or
+		// b) get an error.
+		// Either one is satisfactory, in some broad sense of the term!
+		for written == 0 && err == nil {
+			written, err = tsc.conn.Write(p[:10])
+		}
 		doneChan <- struct{}{}
 	}()
 allDone:
@@ -43,23 +42,34 @@ allDone:
 		select {
 		case <-doneChan:
 			tsc.totalWritten += uint64(written)
-			fmt.Printf("The send is done (%d).\n", tsc.totalWritten)
 			break allDone
 		case <-time.Tick(1 * time.Second):
-			fmt.Printf("The send is (still) blocked (%d).\n", tsc.totalWritten)
+			if window.GetSenderWindowAvailable() {
+				if sndWnd, err := window.GetSenderWindow(tsc.conn); err == nil {
+					fmt.Printf("Receiver window: %d\n", sndWnd)
+				} else {
+					fmt.Printf("Receiver window: -1\n")
+				}
+			}
 		}
 	}
-	return written, err
+	return
 }
 
+var (
+	serverIp   = flag.String("ip", "127.0.0.1", "Server IP address")
+	serverPort = flag.Uint("port", 5001, "Server port")
+)
+
 func main() {
-	conn, err := net.Dial("tcp4", "127.0.0.1:5001")
-	defer conn.Close()
+	flag.Parse()
+	conn, err := net.Dial("tcp4", fmt.Sprintf("%s:%d", *serverIp, *serverPort))
 
 	if err != nil {
-		fmt.Printf("Error: Could not create the server socket: %v\n", err)
+		fmt.Printf("Error: Could not create the server socket (to %s:%d): %v\n", *serverIp, *serverPort, err)
 		os.Exit(-1)
 	}
+	defer conn.Close()
 
 	sendSize := 5000000
 	data := make([]byte, sendSize)
@@ -77,7 +87,5 @@ func main() {
 	}
 	if !success {
 		fmt.Printf("There was an error sending!\n")
-	} else {
-		fmt.Printf("Successful sending!\n")
 	}
 }
