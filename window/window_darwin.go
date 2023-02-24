@@ -1,4 +1,4 @@
-//go:build unix && !darwin
+//go:build darwin
 
 package window
 
@@ -14,18 +14,17 @@ func GetSenderWindowAvailable() bool {
 }
 
 func GetSenderWindow(basicConn net.Conn) (uint32, error) {
-	var err error = nil
-	var info *unix.TCPInfo = nil
-	if info, err = getTCPInfo(basicConn); err == nil {
+	if info, err := getTCPInfo(basicConn); err == nil {
 		return info.Snd_wnd, nil
+	} else {
+		return 0, err
 	}
-	return 0, err
 }
 
 /*
  * Blatant self plagiarism from goresponsiveness.
  */
-func getTCPInfo(basicConn net.Conn) (*unix.TCPInfo, error) {
+func getTCPInfo(basicConn net.Conn) (*unix.TCPConnectionInfo, error) {
 	tcpConn, ok := basicConn.(*net.TCPConn)
 	if !ok {
 		return nil, fmt.Errorf(
@@ -36,9 +35,9 @@ func getTCPInfo(basicConn net.Conn) (*unix.TCPInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	var info *unix.TCPInfo = nil
+	var info *unix.TCPConnectionInfo = nil
 	rawConn.Control(func(fd uintptr) {
-		info, err = unix.GetsockoptTCPInfo(int(fd), unix.SOL_TCP, unix.TCP_INFO)
+		info, err = unix.GetsockoptTCPConnectionInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_CONNECTION_INFO)
 	})
 	return info, err
 }
