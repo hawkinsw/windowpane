@@ -87,6 +87,8 @@ func getTCPInfoRaw(basicConn net.Conn) (*TCPINFO_V1, error) {
 
 	completionRoutine := uintptr(0)
 
+	ov := windows.Overlapped{}
+
 	rawConn.Control(func(fd uintptr) {
 		err = windows.WSAIoctl(
 			windows.Handle(fd),
@@ -96,7 +98,7 @@ func getTCPInfoRaw(basicConn net.Conn) (*TCPINFO_V1, error) {
 			(*byte)(unsafe.Pointer(&outbuf)),
 			cbob,
 			&cbbr,
-			nil,
+			&ov,
 			completionRoutine,
 		)
 	})
