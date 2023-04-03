@@ -15,7 +15,8 @@
  * https://learn.microsoft.com/en-us/windows/win32/debug/retrieving-the-last-error-code
  */
 void PrintError(DWORD last_error) {
-
+  if (last_error == ERROR_ALREADY_EXISTS) {
+  }
   LPTSTR error_string{nullptr};
   FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
                     FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -40,14 +41,43 @@ DWORD WINAPI CompletionThread(LPVOID lpvParam) {
   DWORD bytes_xferred{};
   ULONG64 completion_key{};
   LPOVERLAPPED overlappedp{};
+
+  _tprintf(TEXT("Starting to wait for a completion port event!\n"));
   if (!GetQueuedCompletionStatus(*completion_port_handlep, &bytes_xferred,
                                  &completion_key, &overlappedp, 10000)) {
-    _tprintf(TEXT("GetQueuedCompletionStatus Failed: \n"));
+    _tprintf(TEXT("GetQueuedCompletionStatus Failed: "));
     PrintError(WSAGetLastError());
+    _tprintf(TEXT("\n"));
     return 0;
   }
 
   printf("Proof! The completion port was signaled.\n");
+  return 0;
+}
+
+/** Get a completion status from the given handle.
+ * @param lpvParam A (disguised) pointer to the completion port handle to
+ * monitor.
+ * @note Timeout after 10 seconds.
+ */
+DWORD WINAPI EventThread(LPVOID lpvParam) {
+  LPHANDLE event_handle{static_cast<LPHANDLE>(lpvParam)};
+  DWORD wait_result{};
+
+  _tprintf(TEXT("Starting to wait for an event!\n"));
+  if (wait_result = WaitForSingleObject(*event_handle, INFINITE)) {
+    _tprintf(TEXT("WaitForSingleObject Failed: "));
+    if (wait_result == WAIT_ABANDONED) {
+      _tprintf(TEXT("Wait was abandoned.\n"));
+    } else if (wait_result == WAIT_FAILED) {
+      _tprintf(TEXT("Wait failed:"));
+      PrintError(WSAGetLastError());
+    } else {
+      _tprintf(TEXT("Unknown error: %d\n"), wait_result);
+    }
+    return 0;
+  }
+  printf("Event was signaled!\n");
   return 0;
 }
 
@@ -92,6 +122,16 @@ int main() {
 
   OVERLAPPED ov{};
 
+  auto event_handle{CreateEvent(NULL, TRUE, FALSE, NULL)};
+  if (event_handle == NULL) {
+    _tprintf(TEXT("CreateEvent failed:\n"));
+    PrintError(GetLastError());
+    WSACleanup();
+    return -1;
+  }
+  event_handle = (HANDLE)((uintptr_t)event_handle | 0x1);
+  ov.hEvent = event_handle;
+
   const int BUFFER_LENGTH{4096};
   char buffer_storage[BUFFER_LENGTH]{};
   WSABUF buf{.len = BUFFER_LENGTH, .buf = buffer_storage};
@@ -114,12 +154,26 @@ int main() {
     return -1;
   }
 
-  DWORD dwThreadId{};
-  auto completion_thread{CreateThread(
-      NULL, 0, CompletionThread, (LPVOID)&completion_port, 0, &dwThreadId)};
+  DWORD dwCompletionThreadId{};
+  auto completion_thread{CreateThread(NULL, 0, CompletionThread,
+                                      (LPVOID)&completion_port, 0,
+                                      &dwCompletionThreadId)};
 
   if (completion_thread == NULL) {
     _tprintf(TEXT("CreateThread failed, GLE=%d.\n"), GetLastError());
+    CloseHandle(completion_port);
+    closesocket(ws_socket);
+    WSACleanup();
+    return -1;
+  }
+
+  DWORD dwEventTheadId{};
+  auto event_thread{CreateThread(NULL, 0, EventThread, (LPVOID)&event_handle, 0,
+                                 &dwEventTheadId)};
+
+  if (event_thread == NULL) {
+    _tprintf(TEXT("CreateThread failed, GLE=%d.\n"), GetLastError());
+    CloseHandle(event_handle);
     CloseHandle(completion_port);
     closesocket(ws_socket);
     WSACleanup();
@@ -135,14 +189,14 @@ int main() {
 
     /*
      * The only IO on this socket (i.e., the send of 4k bytes [above]) happened
-     * before the completion port was created (and the socket was associated with
-     * it) -- the server sends back no data. So, in the absence of the WSAIoctl
-     * here, there would be no completion events. Let's do a WSAIoctl and see whether
-     * there is a completion event generated!
-     * 
-     * Note: You can set the 1 to a 0 above to test the above assertion -- without
-     * the WSAIoctl here, the GetQueuedCompletionStatus in the completion thread
-     * will timeout without having received any events.
+     * before the completion port was created (and the socket was associated
+     * with it) -- the server sends back no data. So, in the absence of the
+     * WSAIoctl here, there would be no completion events. Let's do a WSAIoctl
+     * and see whether there is a completion event generated!
+     *
+     * Note: You can set the 1 to a 0 above to test the above assertion --
+     * without the WSAIoctl here, the GetQueuedCompletionStatus in the
+     * completion thread will timeout without having received any events.
      */
     auto ioctl_result{WSAIoctl(
         ws_socket, SIO_TCP_INFO, &tcp_info_version, sizeof(tcp_info_version),
@@ -165,16 +219,33 @@ int main() {
   _tprintf(TEXT("Send Window Size: %d\n"), tcp_info.SndWnd);
 #endif
 
+  HANDLE waitable_objects[2]{completion_thread, event_thread};
+  auto wait_count{0};
+  bool event_signaled{false};
   for (;;) {
-    if (WAIT_TIMEOUT != WaitForSingleObject(completion_thread, 100)) {
-      _tprintf(TEXT("Finished the completion thread!\n"));
-      break;
+    auto wait_result{0};
+    if (WAIT_TIMEOUT != (wait_result = WaitForMultipleObjects(
+                             2, waitable_objects, FALSE, 100))) {
+      if (wait_result == WAIT_OBJECT_0) {
+        _tprintf(TEXT("Completion port thread finished!\n"));
+        wait_count++;
+      }
+      if ((wait_result - WAIT_OBJECT_0) == 1 && !event_signaled) {
+        _tprintf(TEXT("Event handle finished\n"));
+        wait_count++;
+        event_signaled = true;
+      }
+      if (wait_count == 2) {
+        _tprintf(TEXT("Finished both threads!\n"));
+        break;
+      }
     }
     _tprintf(
         TEXT("Timeout waiting for the completion thread to finish ... going "
              "around again.\n"));
   }
 
+  CloseHandle(event_handle);
   CloseHandle(completion_thread);
   CloseHandle(completion_port);
   closesocket(ws_socket);
