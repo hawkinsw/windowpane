@@ -1,0 +1,53 @@
+## (Windows) Overlapped I/O On Runtime-Managed Sockets
+
+### The Goal
+
+According to [MSDN documentation](https://learn.microsoft.com/en-us/windows/win32/fileio/synchronous-and-asynchronous-i-o), "[i]n situations where an I/O request is expected to take a large amount of time ...asynchronous I/O is generally a good way to optimize processing efficiency."
+
+> Note: In Windows, overlapped I/O is used as a synonym for asynchronous I/O.
+
+One of the myriad examples of an I/O operation that may "take a large amount of time" are input and output control (IOCTL) operations on a device or socket. Defining IOCTLs on a device or subsystem exposing sockets (e.g., networking) gives the designer of the API for those entities a flexible way to specify operations where ["it would not be practical to create functions for all the[] cases"](https://www.gnu.org/software/libc/manual/html_node/IOCTLs.html) (e.g., `configure_video_card_to_refresh_rate` or `configure_network_socket_buffer_size`). Instead, the API designer can specify that some IOCTL allows the caller to perform some operation (e.g., the `REFRESH_RATE` IOCTL takes an `int` parameter that sets the rate and a pointer to an `int` to retrieve the value). 
+
+In the future, when the API designer wants to add additional functionality they simply designate another IOCTL -- far easier than coming up with unique and meaningful function names as the API surface expands! For more information on IOCTLs and their utility, see [MSDN](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/introduction-to-i-o-control-codes).
+
+The functions provided by the Win32 API for issuing IOCTLs all support overlapped I/O for exactly the reason specified above -- they may take a long time and blocking the application's progress until completion risks a bad user experience. Each overlapped I/O operation is identified by an `OVERLAPPED` data structure.
+
+> Note: Overlapped (a.k.a asynchronous I/O) is important for "regular" read/write operations, too, but Go already provides great abstractions that the Go programmer can use to take advantage of those capabilities and remain unaffected by the issue presented here. That said, it is *precisely* because Go provides that great support that the problem described herein occurs.
+
+As a general-purpose programming language, especially one focused on solving software-engineering problems highlighted by the rise of ["multicore processors, networked systems, massive computation clusters, and the web programming model"](https://go.dev/talks/2012/splash.article), Go exposes the underlying OS's API to its programmers on all the platforms it supports. If the Win32 API supports overlapped IOCTL operations on devices and sockets then Go should support it too.
+
+### The Problem
+
+The problem discussed herein relates to a particular class of IOCTLs: those that can be used to query/configure [WinSock](https://learn.microsoft.com/en-us/windows/win32/winsock/windows-sockets-start-page-2) sockets. In Windows, those IOCTLs are issued with the [`WSAIoctl`](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsaioctl) function. Go does a marvelous job presenting a consistent interface for creating and using network sockets across platforms giving its programmers the ability to write code against a single API and have it execute on each of Go's supported platforms using the host operating system's most efficient primitives.
+
+In order to implement the great, consistent, high-level networking interface on Windows, the Go runtime relies on overlapped (again, also known as asynchronous) I/O. When the user creates a socket in a Go program running on Windows, the Go runtime adds the native socket that it creates to an I/O completion port. 
+
+[I/O completion ports](https://learn.microsoft.com/en-us/windows/win32/fileio/i-o-completion-ports) are one of the preferred methods for coordinating multiple, outstanding asynchronous I/O operations in a multithreaded program. When a user launches an overlapped I/O operation, they associate that operation with a pointer to an instance of an [`OVERLAPPED`](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-overlapped) data structure. As the asynchronous I/O operation progresses, the OS writes information into that data structure.
+
+Multiple handles (the generic name for a resource in Windows) can be associated with a single I/O completion port. A thread in a user program can poll that completion port to determine when the associated handles require I/O attention. When an overlapped I/O operation changes the state of a handle to indicate that it needs to be service, a thread waiting for a signal on the associated I/O completion port is woken and, among other things, is given information a) to identify the handle needing service and b) a pointer to the `OVERLAPPED` data structure representing the asynchronous request (and, remember, was given at the time the operation was started). 
+
+Go's runtime uses this pattern to support efficient (non-) blocking I/O, generally, and network I/O, specifically. 
+
+There are several consequences of Go's utilization of this pattern:
+
+1. Upon creation, the Go runtime associates each socket with an I/O completion port. However, a handle (in this case, a socket) can only be associated with a single I/O completion port: ["A handle can be associated with only one I/O completion port, and after the association is made, the handle remains associated with that I/O completion port until it is closed."](https://learn.microsoft.com/en-us/windows/win32/fileio/createiocompletionport) Therefore, the Go programmer cannot use I/O completion ports to monitor the progress of asynchronous operations they invoke outside the runtime. The result is that the Go developer has their options for doing asynchronous I/O operations on sockets severely curtailed.
+1. Any change to a handle already associated with an I/O completion port as a result of an overlapped I/O operation (anywhere!) will signal that completion port. If the Go programmer launches an asynchronous I/O operation on a handle managed by the Go runtime (using, e.g., `fd.WSAIoctl`), when the state of that handle changes, the Go runtime is alerted and the mechanisms for servicing that pending I/O begin. The Go runtime assumes that it is the only system that has launched overlapped I/O operations on network sockets. Under that assumption, it infers that it is the only one who created instances of the `OVERLAPPED` data structures associated with those overlapped operations. It relies on this assumption and inference when it services those completion events and [casts, with impunity,](https://github.com/golang/go/blob/master/src/runtime/netpoll_windows.go#L30) the pointer to the `OVERLAPPED` data structure associated with each signaled handle to a pointer to an internal data structure. If a Go program creates its own overlapped I/O operations with its own `OVERLAPPED` data structures then it is *not* possible for the Go runtime to safely cast the pointer it receives after polling the completion port to that internal data type.
+2. Because the Go runtime may come into possession of a pointer to the `OVERLAPPED` data structure created by the user program *sometime* in the future, the user program must access it very carefully and make sure that the memory space targeted by the pointer is not prematurely collected by the garbage collector. Therefore, 
+3. The only time that the user program can safely release that `OVERLAPPED` data structure it created for an asynchronous I/O operation is once that operation has completed. However, because of (1) the user is very limited in their ability to efficiently wait for the completion of a potentially long-running I/O operation. Their first option is to busy-wait using the `GetOverlappedResult` function. Or ...
+
+### The Solution
+
+They could create their own Windows' Event, associate it with the `OVERLAPPED` data structure which itself is associated with an asynchronous I/O operation and use efficient polling techniques provided by the operating system through the [`WaitFor`*Single/Multiple*`Object`](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject) family of functions to determine when the overlapped I/O operation is complete.
+
+There are several reasons for recommending this solution:
+
+1. This solution gives back to Go programmers the power to efficiently wait for the completion of their asynchronous operations even on handles being managed by the Go runtime (Problem (1) above).
+2. With the Go programmer able to efficiently wait for the completion of their asynchronous I/O operation they can manage the lifetime of the instance of `OVERLAPPED` data structure in a way that prevents use-after-free errors and memory leaks (Problems (3) and (4) above). But that's just the start ...
+3. Associating a properly configured Event with an instance of an `OVERLAPPED` data structure that itself is associated with an overlapped I/O operation will keep the operating system from notifying the I/O completion port associated with the socket: ["Even if you have passed the function a file handle associated with a completion port and a valid OVERLAPPED structure, an application can prevent completion port notification. This is done by specifying a valid event handle for the hEvent member of the OVERLAPPED structure, and setting its low-order bit. A valid event handle whose low-order bit is set keeps I/O completion from being queued to the completion port."](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getqueuedcompletionstatus) (Problem (2) above).
+4. The `x/sys/windows` package [already exposes](https://pkg.go.dev/golang.org/x/sys/windows#CreateEvent) the `CreateEvent` system call. Adding a helper function (or even a flag) to set the lower bit (so that the Event Handle meets the criteria above) would be fairly straightforward.
+
+Specific recommendations:
+
+1. Keep [CL478935](https://go-review.googlesource.com/c/go/+/478935) as a means of extra defensiveness. There is no harm in adopting this CL.
+2. Add (if necessary) the helper function described in Solution (4) above.
+3. Add guards to ensure that all overlapped I/O operations on handles (e.g., sockets and file descriptors) that are managed by the Go runtime to ensure that they contain a properly configured Event.
