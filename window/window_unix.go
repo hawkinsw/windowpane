@@ -17,7 +17,7 @@ func GetSenderWindow(basicConn net.Conn) (uint32, error) {
 	var err error = nil
 	var info *unix.TCPInfo = nil
 	if info, err = getTCPInfo(basicConn); err == nil {
-		return info.Snd_cwnd, nil
+		return info.Snd_wnd, nil
 	}
 	return 0, err
 }
